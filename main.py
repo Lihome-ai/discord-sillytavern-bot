@@ -859,26 +859,35 @@ class ResourcePanelView(ui.View):
 @client.event
 async def on_thread_create(thread: discord.Thread):
     print(f"🧵 新 thread 创建：{thread.name}，父频道：{thread.parent}，ID：{thread.id}")
+    print(f"   父频道类型：{type(thread.parent)}")
+    print(f"   父频道名称：{thread.parent.name if thread.parent else 'None'}")
+    print(f"   父频道ID：{thread.parent.id if thread.parent else 'None'}")
     if not isinstance(thread.parent, discord.ForumChannel):
-        print("   不是 Forum 频道，跳过")
+        print("   ❌ 不是 Forum 频道，跳过")
         return
+    print("   ✅ 是 Forum 频道，继续处理...")
     tid = str(thread.id)
     # 延迟 2 秒，等事件完全处理完
+    print(f"   等待2秒...")
     await asyncio.sleep(2)
     if has_panel(tid):
-        print("   已有面板，跳过")
+        print("   ⚠️ 已有面板，跳过")
         return
+    print(f"   没有面板，开始发面板...")
     embed = discord.Embed(
         title="📦 资源面板",
         description="点「获取文件」领取本帖资源。作者点「上传文件」添加新版本。",
         color=0x5865F2
     )
     try:
+        print(f"   尝试发送面板到线程...")
         panel_msg = await thread.send(embed=embed, view=ResourcePanelView())
         set_panel(tid, str(panel_msg.id))
-        print(f"✅ 已在帖子 {thread.name} 发面板")
+        print(f"✅ 已在帖子 {thread.name} 发面板，消息ID：{panel_msg.id}")
     except Exception as e:
-        print(f"❌ 发面板失败：{e}")
+        print(f"❌ 发面板失败：{type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @client.event
@@ -999,6 +1008,23 @@ async def on_message(message: discord.Message):
 
     # 普通文本频道消息（保留调试）
     print(f"📨 收到：{message.author} 在 #{message.channel} 说：{message.content}")
+
+    # 测试命令：/测试面板 - 测试当前频道能不能发面板
+    if message.content.strip() == "/测试面板":
+        print(f"🧪 收到测试面板命令：{message.channel}，类型：{type(message.channel)}")
+        try:
+            embed = discord.Embed(
+                title="🧪 测试面板",
+                description="如果你能看到这条消息，说明Bot能在这个频道发消息。",
+                color=0x5865F2
+            )
+            test_msg = await message.channel.send(embed=embed, view=ResourcePanelView())
+            print(f"✅ 测试面板发送成功，消息ID：{test_msg.id}")
+            await message.channel.send("✅ 测试面板发送成功！")
+        except Exception as e:
+            print(f"❌ 测试面板发送失败：{type(e).__name__}: {e}")
+            await message.channel.send(f"❌ 发送失败：{type(e).__name__}: {e}")
+        return
 
     # 管理组命令：/补面板 - 给旧帖子补资源面板
     if message.content.strip() == "/补面板":
