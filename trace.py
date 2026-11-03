@@ -6,44 +6,41 @@ import sys
 import os
 import json
 import sqlite3
+import struct
+import zlib
 from PIL import Image
 
 
-def read_lsb_watermark(image_path: str) -> str:
-    """从 PNG 图片里读出 LSB 隐写术水印。"""
-    img = Image.open(image_path)
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    pixels = img.load()
-    width, height = img.size
-
-    binary = ""
-    for y in range(height):
-        for x in range(width):
-            r, g, b = pixels[x, y]
-            binary += str(r & 1)
-            binary += str(g & 1)
-            binary += str(b & 1)
-            # 每 8 位转一个字符
-            if len(binary) >= 8:
-                char = chr(int(binary[:8], 2))
-                binary = binary[8:]
-                # 检查结束标记
-                if char == '\x00':
-                    break
-                # 检查是不是 watermark 开头
-                if binary.startswith('1111111111111110'):
-                    break
-        else:
-            continue
-        break
-
-    # 重新正确读取
-    return _read_lsb_correct(image_path)
+def read_png_text_watermark(image_path: str) -> str:
+    """从PNG的tEXt块里读Watermark水印。"""
+    with open(image_path, "rb") as f:
+        data = f.read()
+    
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        return None
+    
+    pos = 8
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos:pos+4])[0]
+        chunk_type = data[pos+4:pos+8].decode("ascii", errors="ignore")
+        chunk_data = data[pos+8:pos+8+length]
+        
+        if chunk_type == "tEXt":
+            null_pos = chunk_data.find(b"\0")
+            if null_pos != -1:
+                keyword = chunk_data[:null_pos].decode("ascii", errors="ignore")
+                if keyword == "Watermark":
+                    return chunk_data[null_pos+1:].decode("ascii", errors="ignore")
+        
+        pos += 4 + 4 + length + 4
+        if chunk_type == "IEND":
+            break
+    
+    return None
 
 
 def _read_lsb_correct(image_path: str) -> str:
-    """正确读取 LSB 水印。"""
+    """正确读取 LSB 水印（旧版本）。"""
     img = Image.open(image_path)
     if img.mode != 'RGB':
         img = img.convert('RGB')
@@ -85,10 +82,16 @@ def read_watermark(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext in ['.png', '.bmp', '.tiff']:
-        # 图片：读 LSB
-        wm = _read_lsb_correct(file_path)
-        if wm.startswith('user_'):
+        # 图片：先尝试读新的PNG文本块水印
+        wm = read_png_text_watermark(file_path)
+        if wm and wm.startswith('user_'):
             return wm.replace('user_', '')
+        
+        # 如果读不到，再尝试读旧的LSB水印
+        wm = _read_lsb_correct(file_path)
+        if wm and wm.startswith('user_'):
+            return wm.replace('user_', '')
+        
         return None
 
     elif ext == '.json':

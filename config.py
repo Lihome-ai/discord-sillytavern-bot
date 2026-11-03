@@ -16,6 +16,7 @@ ROLE_REVIEWER = "审核组"        # 审核组（只能审核，不能看资源�
 ROLE_ADMIN = "管理组"          # 管理组（能看资源备份、管理所有资源）
 ROLE_AUTHOR = "作者"           # 基础创作者
 ROLE_ABYSS = "深渊者"          # 深渊区身份
+ROLE_OWNER = "锦漓"             # 服务器主理人
 
 # === 审核答题须知（发给用户看的）===
 REVIEW_NOTICE = """**审核答题须知：**

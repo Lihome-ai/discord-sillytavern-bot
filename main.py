@@ -8,7 +8,7 @@ import discord
 from discord import ui
 from discord.ext import tasks
 from config import (
-    DISCORD_TOKEN, ROLE_NEWBIE, ROLE_REVIEWED, ROLE_REVIEWER, ROLE_ADMIN, ROLE_AUTHOR, ROLE_ABYSS,
+    DISCORD_TOKEN, ROLE_NEWBIE, ROLE_REVIEWED, ROLE_REVIEWER, ROLE_ADMIN, ROLE_AUTHOR, ROLE_ABYSS, ROLE_OWNER,
     REVIEW_NOTICE, QUESTIONS, AGE_VERIFY_TASK, ANSWER_TIMEOUT,
     REVIEWER_DM_MESSAGES, ARCHIVE_CATEGORY_NAME
 )
@@ -18,9 +18,15 @@ from database import (
     mark_ticket_started, get_expired_answering_tickets,
     get_expired_newbie_users, clear_newbie_flag,
     has_panel, set_panel, get_panel_message_id, add_resource_file, get_files_by_thread, get_file,
-    add_claim, get_recent_claims
+    add_claim, get_recent_claims, toggle_file_lock, set_file_deleted, set_delete_requested,
+    try_claim_review, reset_review, set_delete_at, clear_delete_at, get_pending_delays
 )
 from watermark import add_watermark
+from approve_messages import (
+    AUTHOR_BLESSINGS, ADMIN_THANKS, OWNER_REPORTS,
+    ADMIN_REJECT_THANKS, OWNER_REJECT_REPORTS,
+    OWNER_DELAY_FLATTERY, OWNER_DONE_FLATTERY
+)
 
 intents = discord.Intents.default()
 intents.members = True
@@ -723,6 +729,43 @@ async def on_ready():
     client.add_view(WelcomeView())
     client.add_view(ReviewerControlView())
     client.add_view(IdentityClaimView())
+    client.add_dynamic_items(DeleteReviewButton)
+    # 恢复未完成的延时删除任务（重启后仍能按时执行）
+    from datetime import datetime as _dt
+    for _d in get_pending_delays():
+        _fid = _d["file_id"]
+        _target = _dt.fromisoformat(_d["delete_at"])
+        _wait = (_target - _dt.now(timezone.utc)).total_seconds()
+
+        async def _resume_delete(fid=_fid, wait=_wait):
+            if wait > 0:
+                await asyncio.sleep(wait)
+            f_info = get_file(fid)
+            if f_info and not f_info.get("is_deleted"):
+                set_file_deleted(fid)
+                clear_delete_at(fid)
+                try:
+                    if f_info.get("uploader_id"):
+                        au = client.get_user(int(f_info["uploader_id"]))
+                        if au:
+                            await au.send("⏰ 延时时间到，资源已删除。")
+                except Exception:
+                    pass
+                # 通知锦漓：重启恢复的延时任务已执行
+                import random
+                _th = client.get_channel(int(f_info["thread_id"]))
+                _gd = _th.guild if _th else None
+                done_report = (
+                    "✅ 全知报告·延时删除已执行（重启恢复任务）\n"
+                    "资源名称：" + f_info["filename"] + "\n"
+                    "帖子链接：" + (_th.mention if _th else "（帖子）") + "\n"
+                    "实际执行时间：" + _dt.now().strftime("%Y年%m月%d日 %H:%M") + "\n"
+                    "备注：该任务经Bot重启后自动恢复并执行\n"
+                    + random.choice(OWNER_DONE_FLATTERY)
+                )
+                await send_owner_report(client, _gd, done_report)
+
+        client.loop.create_task(_resume_delete())
     if not cleanup_archived_channels.is_running():
         cleanup_archived_channels.start()
     if not auto_submit_expired_tickets.is_running():
@@ -736,7 +779,23 @@ async def on_ready():
 
 
 _panel_pending = set()  # 内存锁：正在处理中的 thread_id
+_delete_sessions = {}   # user_id -> thread_id（正在申请删除的会话）
 _upload_sessions = {}   # user_id -> thread_id（正在上传的会话）
+_delay_sessions = {}   # admin_id -> file_id（正在设置延时删除的会话）
+
+
+async def send_owner_report(client, guild, text):
+    """给锦漓身份组成员发送全知通知（独立通道，不影响主流程）。"""
+    if not guild:
+        return
+    owner_role = discord.utils.get(guild.roles, name=ROLE_OWNER)
+    if not owner_role:
+        return
+    for om in owner_role.members:
+        try:
+            await om.send(text)
+        except Exception:
+            pass
 
 
 class FileSelectView(ui.View):
@@ -761,6 +820,23 @@ class FileSelectView(ui.View):
         if not f:
             await interaction.followup.send("❌ 文件不存在", ephemeral=True)
             return
+        # 检查是否已删除
+        if f.get("is_deleted"):
+            await interaction.followup.send("📭 这个资源已被删除", ephemeral=True)
+            return
+        # 检查是否锁定
+        if f.get("is_locked"):
+            # 锁定了，检查是不是管理组或锦漓
+            admin_role = discord.utils.get(interaction.guild.roles, name=ROLE_ADMIN)
+            owner_role = discord.utils.get(interaction.guild.roles, name=ROLE_OWNER)
+            is_allowed = False
+            if admin_role and admin_role in interaction.user.roles:
+                is_allowed = True
+            if owner_role and owner_role in interaction.user.roles:
+                is_allowed = True
+            if not is_allowed:
+                await interaction.followup.send("🔒 这个资源已被锁定，普通用户无法获取", ephemeral=True)
+                return
         # 频率检查
         if get_recent_claims(str(interaction.user.id), minutes=5) >= 10:
             await interaction.followup.send("⏰ 领取太频繁了，5 分钟后再试", ephemeral=True)
@@ -792,11 +868,16 @@ class ResourcePanelView(ui.View):
         super().__init__(timeout=None)
 
     async def _is_author_or_admin(self, interaction: discord.Interaction) -> bool:
-        author_role = discord.utils.get(interaction.guild.roles, name=ROLE_AUTHOR)
+        """检查是不是本帖楼主本人，或者管理组。只有这两类能上传、锁定、申请删除。"""
+        # 管理组可以
         admin_role = discord.utils.get(interaction.guild.roles, name=ROLE_ADMIN)
-        return (author_role and author_role in interaction.user.roles) or \
-               (admin_role and admin_role in interaction.user.roles)
-
+        if admin_role and admin_role in interaction.user.roles:
+            return True
+        # 本帖楼主可以
+        thread = interaction.channel
+        if isinstance(thread, discord.Thread) and thread.owner_id == interaction.user.id:
+            return True
+        return False
     async def _has_reacted(self, thread: discord.Thread, user: discord.User) -> bool:
         """检查用户是否给帖子首楼点了任何反应。"""
         try:
@@ -826,6 +907,23 @@ class ResourcePanelView(ui.View):
             return
         # 选最新版本
         f = files[0]
+        # 检查是否已删除
+        if f.get("is_deleted"):
+            await interaction.followup.send("📭 这个资源已被删除", ephemeral=True)
+            return
+        # 检查是否锁定
+        if f.get("is_locked"):
+            # 锁定了，检查是不是管理组或锦漓
+            admin_role = discord.utils.get(interaction.guild.roles, name=ROLE_ADMIN)
+            owner_role = discord.utils.get(interaction.guild.roles, name=ROLE_OWNER)
+            is_allowed = False
+            if admin_role and admin_role in interaction.user.roles:
+                is_allowed = True
+            if owner_role and owner_role in interaction.user.roles:
+                is_allowed = True
+            if not is_allowed:
+                await interaction.followup.send("🔒 这个资源已被锁定，普通用户无法获取", ephemeral=True)
+                return
         # 频率检查
         if get_recent_claims(str(interaction.user.id), minutes=5) >= 10:
             await interaction.followup.send("⏰ 领取太频繁了，5 分钟后再试", ephemeral=True)
@@ -855,6 +953,202 @@ class ResourcePanelView(ui.View):
         except discord.Forbidden:
             await interaction.followup.send("❌ 无法私信你，请先打开 DM 权限", ephemeral=True)
 
+    @ui.button(label="锁定/解锁", style=discord.ButtonStyle.secondary, emoji="🔒", custom_id="panel_lock")
+    async def toggle_lock(self, interaction: discord.Interaction, button: ui.Button):
+        print(f"🔘 锁定/解锁按钮被点击：{interaction.user}")
+        if not await self._is_author_or_admin(interaction):
+            await interaction.response.send_message("❌ 只有作者和管理组可以锁定/解锁", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        thread_id = str(interaction.channel.id)
+        files = get_files_by_thread(thread_id)
+        if not files:
+            await interaction.followup.send("📭 本帖还没有上传文件", ephemeral=True)
+            return
+        f = files[0]
+        new_state = toggle_file_lock(f["file_id"])
+        if new_state:
+            await interaction.followup.send("🔒 已锁定！普通用户现在无法获取这个资源了", ephemeral=True)
+        else:
+            await interaction.followup.send("🔓 已解锁！普通用户现在可以获取这个资源了", ephemeral=True)
+    @ui.button(label="申请删除", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="panel_delete")
+    async def request_delete(self, interaction: discord.Interaction, button: ui.Button):
+        print(f"🔘 申请删除按钮被点击：{interaction.user}")
+        if not await self._is_author_or_admin(interaction):
+            await interaction.response.send_message("❌ 只有本帖作者和管理组可以申请删除", ephemeral=True)
+            return
+        thread_id = str(interaction.channel.id)
+        _delete_sessions[str(interaction.user.id)] = thread_id
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.user.send(
+                f"🗑️ 你正在申请删除本帖资源。\n"
+                f"请在同一条消息里回复以下信息：\n"
+                f"1. 删除理由\n"
+                f"2. 是否需要延时删除（需要/不需要）\n"
+                f"3. 如果需要延时，请写明延时多久（例如：延时7天）"
+            )
+            await interaction.followup.send("✅ 已私信你，请在私信里填写删除理由和延时信息", ephemeral=True)
+        except discord.Forbidden:
+            _delete_sessions.pop(str(interaction.user.id), None)
+            await interaction.followup.send("❌ 无法私信你，请先打开 DM 权限", ephemeral=True)
+
+
+
+class DeleteReviewButton(ui.DynamicItem, template=r"delete_review:(?P<action>[a-z]+):(?P<file_id>\d+)"):
+    # 三种动作的样式配置
+    STYLES = {
+        "approve": (discord.ButtonStyle.danger, "同意删除", "✅"),
+        "delay": (discord.ButtonStyle.secondary, "延时删除", "⏰"),
+        "reject": (discord.ButtonStyle.secondary, "驳回", "❌"),
+    }
+
+    def __init__(self, action, file_id):
+        style, label, emoji = self.STYLES[action]
+        super().__init__(ui.Button(
+            custom_id=f"delete_review:{action}:{file_id}",
+            style=style, label=label, emoji=emoji
+        ))
+        self.action = action
+        self.file_id = int(file_id)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        # 框架传入 match 对象，从命名组提取参数
+        return cls(match.group("action"), match.group("file_id"))
+
+    async def _is_admin(self, interaction):
+        mutual = getattr(interaction.user, "mutual_guilds", None)
+        guilds = mutual or interaction.client.guilds
+        for guild in guilds:
+            member = guild.get_member(interaction.user.id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(interaction.user.id)
+                except Exception:
+                    continue
+            admin_role = discord.utils.get(guild.roles, name=ROLE_ADMIN)
+            if admin_role and admin_role in member.roles:
+                return True
+        return False
+
+    async def callback(self, interaction):
+        client = interaction.client
+        if not await self._is_admin(interaction):
+            await interaction.response.send_message("❌ 只有管理组可以审核", ephemeral=True)
+            return
+
+        # 原子抢占：防止多个管理员同时处理同一申请
+        if not try_claim_review(self.file_id):
+            await interaction.response.send_message(
+                "⚠️ 该删除申请已被其他管理员处理，无需重复操作。", ephemeral=True
+            )
+            return
+
+        if self.action == "delay":
+            _delay_sessions[str(interaction.user.id)] = self.file_id
+            await interaction.response.send_message(
+                "⏰ 请直接在本私信回复延时时间，例如：7天、24小时、30分钟", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        if self.action == "approve":
+            set_file_deleted(self.file_id)
+            clear_delete_at(self.file_id)
+            embed = interaction.message.embeds[0]
+            embed.color = 0x2B2D31
+            embed.title = "✅ 已同意删除（审核人：" + str(interaction.user) + "）"
+            await interaction.message.edit(embed=embed, view=None)
+            await interaction.followup.send("✅ 已同意，资源已标记删除", ephemeral=True)
+            await self._approve_notify(interaction)
+        else:
+            embed = interaction.message.embeds[0]
+            embed.color = 0x57F287
+            embed.title = "❌ 已驳回删除申请（审核人：" + str(interaction.user) + "）"
+            await interaction.message.edit(embed=embed, view=None)
+            await interaction.followup.send("❌ 已驳回删除申请", ephemeral=True)
+            await self._reject_notify(interaction)
+
+    async def _approve_notify(self, interaction):
+        import random
+        from datetime import datetime
+        client = interaction.client
+        try:
+            f_info = get_file(self.file_id)
+            if not f_info:
+                return
+            thread = client.get_channel(int(f_info["thread_id"]))
+            thread_mention = thread.mention if thread else "（帖子）"
+            author_user = None
+            if f_info.get("uploader_id"):
+                author_user = client.get_user(int(f_info["uploader_id"]))
+            author_str = str(author_user) if author_user else "作者"
+            if author_user:
+                msg = "管理组已通过删除（" + thread_mention + "，文件：" + f_info["filename"] + "）。\n" + random.choice(AUTHOR_BLESSINGS)
+                await author_user.send(msg)
+            await interaction.user.send(random.choice(ADMIN_THANKS).format(author=author_str))
+            target_guild = thread.guild if thread else None
+            if not target_guild:
+                for g in client.guilds:
+                    if g.get_member(interaction.user.id):
+                        target_guild = g
+                        break
+            if target_guild:
+                owner_role = discord.utils.get(target_guild.roles, name=ROLE_OWNER)
+                if owner_role:
+                    now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+                    report = random.choice(OWNER_REPORTS).format(
+                        admin=str(interaction.user), time=now_str, author=author_str
+                    )
+                    for om in owner_role.members:
+                        try:
+                            await om.send(report)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print("同意删除三方通知出错：", e)
+
+    async def _reject_notify(self, interaction):
+        import random
+        from datetime import datetime
+        client = interaction.client
+        try:
+            f_info = get_file(self.file_id)
+            if not f_info:
+                return
+            author_str = "作者"
+            if f_info.get("uploader_id"):
+                author_user = client.get_user(int(f_info["uploader_id"]))
+                author_str = str(author_user) if author_user else "作者"
+                # 作者：不透露具体管理员身份
+                if author_user:
+                    await author_user.send("❌ 你的删除申请已被管理组驳回，资源保留。")
+            # 操作管理员：感谢反馈
+            await interaction.user.send(random.choice(ADMIN_REJECT_THANKS).format(author=author_str))
+            # 锦漓：全知驳回报告
+            thread = client.get_channel(int(f_info["thread_id"]))
+            target_guild = thread.guild if thread else None
+            if not target_guild:
+                for g in client.guilds:
+                    if g.get_member(interaction.user.id):
+                        target_guild = g
+                        break
+            if target_guild:
+                owner_role = discord.utils.get(target_guild.roles, name=ROLE_OWNER)
+                if owner_role:
+                    now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+                    report = random.choice(OWNER_REJECT_REPORTS).format(
+                        admin=str(interaction.user), time=now_str, author=author_str
+                    )
+                    for om in owner_role.members:
+                        try:
+                            await om.send(report)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print("驳回三方通知出错：", e)
 
 @client.event
 async def on_thread_create(thread: discord.Thread):
@@ -896,6 +1190,147 @@ async def on_message(message: discord.Message):
         return
 
     # DM 里的文件上传处理
+    # DM 里的删除申请理由（纯文本，无附件）
+    if isinstance(message.channel, discord.DMChannel) and not message.attachments:
+        uid = str(message.author.id)
+        if uid in _delete_sessions:
+            thread_id = _delete_sessions.pop(uid)
+            reason_text = message.content.strip()
+            files = get_files_by_thread(thread_id)
+            if not files:
+                await message.channel.send("❌ 找不到这个帖子的文件了")
+                return
+            f = files[0]
+            # 找到帖子所在的guild和thread
+            target_thread = client.get_channel(int(thread_id))
+            if not target_thread or not hasattr(target_thread, "owner_id"):
+                await message.channel.send("❌ 找不到帖子了")
+                return
+            target_guild = target_thread.guild
+            author = target_guild.get_member(message.author.id)
+            admin_role = discord.utils.get(target_guild.roles, name=ROLE_ADMIN)
+            if not admin_role:
+                await message.channel.send("❌ 找不到管理组身份组")
+                return
+            # 给管理组发审核卡片
+            embed = discord.Embed(title="🗑️ 删除申请审核", color=0xED4245)
+            if author:
+                embed.set_author(name=str(author), icon_url=author.display_avatar.url)
+                embed.set_thumbnail(url=author.display_avatar.url)
+            embed.add_field(name="帖子", value=target_thread.mention, inline=False)
+            embed.add_field(name="文件名", value=f["filename"], inline=False)
+            embed.add_field(name="作者填写的理由和延时信息", value=reason_text, inline=False)
+            embed.add_field(name="作者 Discord ID", value=str(message.author.id), inline=False)
+            review_view = ui.View(timeout=None)
+            review_view.add_item(DeleteReviewButton("approve", f["file_id"]))
+            review_view.add_item(DeleteReviewButton("delay", f["file_id"]))
+            review_view.add_item(DeleteReviewButton("reject", f["file_id"]))
+            for member in admin_role.members:
+                try:
+                    await member.send(embed=embed, view=review_view)
+                except:
+                    pass
+            set_delete_requested(f["file_id"], reason_text)
+            # 给作者发成功提示（随机祝福语）
+            channel_blessings = [
+                "申请已经悄悄递到管理组手里啦，稍安勿躁哦 (・ω・)",
+                "好嘞，删除申请已送达，管理组会尽快处理的～",
+                "收到！你的申请已经飞去找管理组啦，请耐心等待 (´・ω・`)"
+            ]
+            import random
+            await message.channel.send("✅ 已成功发送给管理组您的删除申请。\n" + random.choice(channel_blessings))
+            # 再私信作者，提示选择删除（随机祝福语）
+            dm_blessings = [
+                "辛苦啦，删除申请已经帮你送到管理组那边咯，好好休息一下吧 (｡･ω･｡)",
+                "你的申请我已经妥善交给管理组啦，剩下的交给他们就好～",
+                "叮咚！删除申请已成功送达，别担心，一切顺利哦 (・ω・)ノ",
+                "申请已安全抵达管理组手中，你先忙别的吧，有结果会通知你的 (´｡• ω •｡`)"
+            ]
+            await message.channel.send("🗑️ 你选择删除这个帖子的文件。\n" + random.choice(dm_blessings))
+            return
+
+        if uid in _delay_sessions:
+            file_id = _delay_sessions.pop(uid)
+            import re
+            from datetime import datetime, timedelta, timezone
+            text = message.content.strip()
+            match = re.search(r"(\d+)\s*(天|日|小时|分钟|秒)", text)
+            if not match:
+                reset_review(file_id)  # 释放审核抢占，允许重新处理
+                await message.channel.send("❌ 没看懂时间，请重新点延时按钮，用例如：7天、24小时")
+                return
+            num = int(match.group(1))
+            unit = match.group(2)
+            if unit in ("天", "日"):
+                seconds = num * 86400
+            elif unit == "小时":
+                seconds = num * 3600
+            elif unit == "分钟":
+                seconds = num * 60
+            else:
+                seconds = num
+
+            # 持久化目标执行时间（UTC ISO），Bot重启后可恢复
+            target_dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+            set_delete_at(file_id, target_dt.isoformat())
+
+            # 通知锦漓：延时决定的完整详情
+            import random
+            f_now = get_file(file_id)
+            thread = client.get_channel(int(f_now["thread_id"])) if f_now else None
+            guild = thread.guild if thread else None
+            author_str = "作者"
+            if f_now and f_now.get("uploader_id"):
+                _au0 = client.get_user(int(f_now["uploader_id"]))
+                if _au0:
+                    author_str = str(_au0)
+            _local_target = datetime.now() + timedelta(seconds=seconds)
+            delay_report = (
+                "⏰ 全知报告·延时删除决定\n"
+                "操作管理员：" + str(message.author) + "\n"
+                "决定时间：" + datetime.now().strftime("%Y年%m月%d日 %H:%M") + "\n"
+                "申请作者：" + author_str + "\n"
+                "资源名称：" + (f_now["filename"] if f_now else "") + "\n"
+                "帖子链接：" + (thread.mention if thread else "（帖子）") + "\n"
+                "申请理由：" + str(f_now.get("delete_reason") or "无") + "\n"
+                "处理方式：延时删除\n"
+                "延时时长：" + str(num) + unit + "\n"
+                "计划执行时间：" + _local_target.strftime("%Y年%m月%d日 %H:%M") + "\n"
+                + random.choice(OWNER_DELAY_FLATTERY)
+            )
+            await send_owner_report(client, guild, delay_report)
+
+            async def _do_delay_delete():
+                await asyncio.sleep(seconds)
+                f_info = get_file(file_id)
+                if f_info and not f_info.get("is_deleted"):
+                    set_file_deleted(file_id)
+                    clear_delete_at(file_id)
+                    try:
+                        if f_info.get("uploader_id"):
+                            au = client.get_user(int(f_info["uploader_id"]))
+                            if au:
+                                await au.send("⏰ 延时时间到，资源已删除。")
+                    except Exception:
+                        pass
+                    # 通知锦漓：延时到期、已实际执行
+                    _th = client.get_channel(int(f_info["thread_id"]))
+                    _gd = _th.guild if _th else None
+                    done_report = (
+                        "✅ 全知报告·延时删除已执行\n"
+                        "资源名称：" + f_info["filename"] + "\n"
+                        "帖子链接：" + (_th.mention if _th else "（帖子）") + "\n"
+                        "原延时时长：" + str(num) + unit + "\n"
+                        "实际执行时间：" + datetime.now().strftime("%Y年%m月%d日 %H:%M") + "\n"
+                        "操作管理员：" + str(message.author) + "\n"
+                        + random.choice(OWNER_DONE_FLATTERY)
+                    )
+                    await send_owner_report(client, _gd, done_report)
+
+            client.loop.create_task(_do_delay_delete())
+            await message.channel.send("✅ 好的，将在" + str(num) + unit + "后删除这个资源。")
+            return
+
     if isinstance(message.channel, discord.DMChannel) and message.attachments:
         uid = str(message.author.id)
         # 先检查：是不是管理组发文件来追溯的？
@@ -942,6 +1377,13 @@ async def on_message(message: discord.Message):
         if uid in _upload_sessions:
             thread_id = _upload_sessions.pop(uid)
             att = message.attachments[0]
+            
+            # 检查文件大小，最大50MB
+            MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+            if att.size > MAX_FILE_SIZE:
+                await message.channel.send(f"❌ 文件太大了！最大支持50MB，你的文件是 {att.size / 1024 / 1024:.1f}MB")
+                return
+            
             # 解析消息内容：版本名
             version = message.content.strip() or "无版本"
             # 下载文件
@@ -966,8 +1408,8 @@ async def on_message(message: discord.Message):
                         embed.add_field(name="文件名", value=att.filename, inline=True)
                         embed.add_field(name="版本", value=version, inline=True)
                         embed.add_field(name="上传者", value=f"{message.author}（ID: {uid}）", inline=False)
-                        embed.add_field(name="下载链接", value=att.url, inline=False)
                         await backup_channel.send(embed=embed)
+                        await backup_channel.send(file=discord.File(save_path))
                     except Exception as e:
                         print(f"备份频道发消息失败：{e}")
             await message.channel.send(

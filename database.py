@@ -75,6 +75,15 @@ def init_db():
     ticket_cols = [r[1] for r in conn.execute("PRAGMA table_info(tickets)").fetchall()]
     if "started_at" not in ticket_cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN started_at TEXT")
+    # 资源文件表的兼容字段（锁定/删除/审核/延时）
+    rf_cols = [r[1] for r in conn.execute("PRAGMA table_info(resource_files)").fetchall()]
+    for _int_col in ("is_locked", "is_deleted", "delete_requested", "review_done"):
+        if _int_col not in rf_cols:
+            conn.execute(f"ALTER TABLE resource_files ADD COLUMN {_int_col} INTEGER DEFAULT 0")
+    if "delete_reason" not in rf_cols:
+        conn.execute("ALTER TABLE resource_files ADD COLUMN delete_reason TEXT")
+    if "delete_at" not in rf_cols:
+        conn.execute("ALTER TABLE resource_files ADD COLUMN delete_at TEXT")
     conn.commit()
     conn.close()
 
@@ -267,3 +276,86 @@ def get_recent_claims(user_id: str, minutes: int = 5):
     row = cur.fetchone()
     conn.close()
     return row["cnt"] if row else 0
+
+
+def toggle_file_lock(file_id: int) -> bool:
+    """切换文件的锁定状态，返回新状态。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT is_locked FROM resource_files WHERE file_id = ?", (file_id,))
+    row = c.fetchone()
+    if not row:
+        return False
+    new_state = 0 if row[0] else 1
+    c.execute("UPDATE resource_files SET is_locked = ? WHERE file_id = ?", (new_state, file_id))
+    conn.commit()
+    conn.close()
+    return bool(new_state)
+
+
+def set_file_deleted(file_id: int):
+    """标记文件为已删除。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE resource_files SET is_deleted = 1 WHERE file_id = ?", (file_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_delete_requested(file_id: int, reason: str):
+    """标记文件有删除申请。"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE resource_files SET delete_requested = 1, delete_reason = ? WHERE file_id = ?", (reason, file_id))
+    conn.commit()
+    conn.close()
+
+
+# === 审核幂等 + 延时持久化 ===
+
+def try_claim_review(file_id: int) -> bool:
+    """原子抢占审核：只有 review_done=0 时能置为1，返回是否抢占成功。"""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE resource_files SET review_done=1 WHERE file_id=? AND review_done=0",
+        (file_id,),
+    )
+    conn.commit()
+    ok = cur.rowcount == 1
+    conn.close()
+    return ok
+
+
+def reset_review(file_id: int):
+    """重置审核抢占标记（用于延时场景，等待真正执行）。"""
+    conn = get_conn()
+    conn.execute("UPDATE resource_files SET review_done=0 WHERE file_id=?", (file_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_delete_at(file_id: int, when_iso):
+    """记录延时删除的目标时间（UTC ISO 字符串）。"""
+    conn = get_conn()
+    conn.execute("UPDATE resource_files SET delete_at=? WHERE file_id=?", (when_iso, file_id))
+    conn.commit()
+    conn.close()
+
+
+def clear_delete_at(file_id: int):
+    """清除延时时间标记。"""
+    conn = get_conn()
+    conn.execute("UPDATE resource_files SET delete_at=NULL WHERE file_id=?", (file_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_pending_delays():
+    """返回所有未执行的延时任务（delete_at 非空且未删除）。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT file_id, delete_at FROM resource_files "
+        "WHERE delete_at IS NOT NULL AND is_deleted=0"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

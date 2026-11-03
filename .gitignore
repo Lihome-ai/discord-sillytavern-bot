@@ -24,3 +24,13 @@ uploads/
 
 # 数据库文件
 bot.db
+
+# 备份文件（不提交）
+*.bak
+*.bak_*
+*.before_*
+*.no_*
+
+# 临时/测试文件
+result.txt
+offline_test_remote.py
